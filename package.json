@@ -1,0 +1,29 @@
+{
+  "name": "pi-inspect-image",
+  "version": "1.0.0",
+  "description": "Pi extension that registers an inspect_image tool — analyzes local image files using a configurable vision-capable model via OpenAI-compatible API",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "vision",
+    "image-analysis",
+    "multimodal"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TanJeeSchuan/pi-inspect-image"
+  },
+  "author": "tanjeeschuan",
+  "files": [
+    "extensions/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
