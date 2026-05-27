@@ -1,6 +1,7 @@
-import { readFile } from "node:fs/promises";
-import { extname, resolve as resolvePath } from "node:path";
-import { defineTool, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, extname, join, resolve as resolvePath } from "node:path";
+import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 // ── Types ───────────────────────────────────────────────────────────
@@ -19,14 +20,46 @@ interface InspectImageDetails {
 	model: string;
 }
 
-// ── Settings ────────────────────────────────────────────────────────
+// ── Settings I/O ────────────────────────────────────────────────────
 
-const settings = SettingsManager.create(process.cwd());
+function projectSettingsPath(cwd: string): string {
+	return join(cwd, ".pi", "settings.json");
+}
 
-function getVisionConfig(): VisionConfig | undefined {
-	const globalSettings = settings.getGlobalSettings() as Record<string, unknown>;
-	const projectSettings = settings.getProjectSettings() as Record<string, unknown>;
-	return (projectSettings.visionConfig ?? globalSettings.visionConfig) as VisionConfig | undefined;
+async function readProjectSettingsRaw(cwd: string): Promise<Record<string, unknown>> {
+	const path = projectSettingsPath(cwd);
+	if (!existsSync(path)) return {};
+	try {
+		const raw = await readFile(path, "utf-8");
+		return JSON.parse(raw);
+	} catch {
+		return {};
+	}
+}
+
+async function writeProjectSettings(cwd: string, settings: Record<string, unknown>): Promise<void> {
+	const path = projectSettingsPath(cwd);
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, JSON.stringify(settings, null, 2) + "\n", "utf-8");
+}
+
+async function saveVisionConfig(cwd: string, config: VisionConfig): Promise<void> {
+	const settings = await readProjectSettingsRaw(cwd);
+	settings.visionConfig = config;
+	await writeProjectSettings(cwd, settings);
+}
+
+// ── Vision Config Resolution ────────────────────────────────────────
+
+function getVisionConfig(cwd: string): VisionConfig | undefined {
+	const path = projectSettingsPath(cwd);
+	if (!existsSync(path)) return undefined;
+	try {
+		const raw = JSON.parse(readFileSync(path, "utf-8"));
+		return raw.visionConfig as VisionConfig | undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 // ── API URL Resolution ──────────────────────────────────────────────
@@ -48,6 +81,68 @@ function resolveApiUrl(provider: string, baseUrl?: string): string {
 	return url;
 }
 
+// ── Interactive Setup ───────────────────────────────────────────────
+
+async function runVisionSetup(ctx: ExtensionContext): Promise<VisionConfig | undefined> {
+	// Build provider list from registry (auth-configured, with vision models)
+	const available = ctx.modelRegistry.getAvailable();
+	const visionByProvider = new Map<string, string>(); // provider -> display name
+	for (const m of available) {
+		if (m.input.includes("image") && !visionByProvider.has(m.provider)) {
+			visionByProvider.set(m.provider, ctx.modelRegistry.getProviderDisplayName(m.provider));
+		}
+	}
+
+	const providerOptions = [...visionByProvider.values()];
+	if (providerOptions.length > 0) {
+		providerOptions.push("▸ Other (type provider name)…");
+	}
+
+	// Step 1: Provider
+	let provider: string | undefined;
+	if (providerOptions.length > 0) {
+		const choice = await ctx.ui.select(
+			"Choose a vision provider  │  💡 project → .pi/settings.json  │  global → ~/.pi/agent/settings.json",
+			providerOptions,
+		);
+		if (!choice) return undefined;
+		if (choice.startsWith("▸")) {
+			provider = undefined;
+		} else {
+			// Reverse-lookup provider key from display name
+			for (const [key, name] of visionByProvider) {
+				if (name === choice) { provider = key; break; }
+			}
+		}
+	}
+	if (!provider) {
+		provider = await ctx.ui.input("Enter provider name:", "e.g. openai, openrouter");
+		if (!provider) return undefined;
+	}
+
+	// Step 2: Model ID
+	const modelId = await ctx.ui.input("Enter model ID:", "e.g. gpt-4o");
+	if (!modelId) return undefined;
+
+	// Validate against registry
+	const found = ctx.modelRegistry.find(provider, modelId);
+	if (!found) {
+		ctx.ui.notify(
+			`Model "${modelId}" not found for provider "${provider}" in the registry — ensure it supports vision.`,
+			"warning",
+		);
+	} else if (!found.input.includes("image")) {
+		ctx.ui.notify(
+			`Model "${modelId}" does not list image support — vision calls may fail.`,
+			"warning",
+		);
+	}
+
+	const config: VisionConfig = { provider, model: modelId };
+	await saveVisionConfig(ctx.cwd, config);
+	return config;
+}
+
 // ── Tool Schema ─────────────────────────────────────────────────────
 
 const InspectImageParams = Type.Object({
@@ -62,23 +157,42 @@ const InspectImageParams = Type.Object({
 // ── Extension Factory ───────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+	// ── Command: /setup-vision ──────────────────────────────────
+	pi.registerCommand("setup-vision", {
+		description: "Pick a vision model for the inspect_image tool",
+		handler: async (_args, ctx) => {
+			const config = await runVisionSetup(ctx);
+			if (config) {
+				const name = ctx.modelRegistry.getProviderDisplayName(config.provider);
+				ctx.ui.notify(`Vision model: ${name} / ${config.model}`, "info");
+			}
+		},
+	});
+
+	// ── Tool: inspect_image ─────────────────────────────────────
 	pi.registerTool(
 		defineTool({
 			name: "inspect_image",
 			label: "Inspect Image",
 			description:
-				"Analyze an image file using a vision-capable model. Returns a text description of what the image contains.",
+				"Analyze an image file using a vision-capable model. Returns a text description of the image contents. " +
+				"If no vision model is selected yet, you'll be prompted to pick one from your configured providers — " +
+				"or run /setup-vision beforehand.",
 			parameters: InspectImageParams,
 
 			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 				const { path, prompt } = params;
 
 				// Resolve vision configuration
-				const visionConfig = getVisionConfig();
+				let visionConfig = getVisionConfig(ctx.cwd);
 				if (!visionConfig) {
-					throw new Error(
-						`No visionConfig found in settings. Add a "visionConfig" block to .pi/settings.json or ~/.pi/agent/settings.json.`,
-					);
+					visionConfig = await runVisionSetup(ctx);
+					if (!visionConfig) {
+						throw new Error(
+							"Vision setup was cancelled or no vision models are available. " +
+								"Run /setup-vision to configure, or add a 'visionConfig' block to .pi/settings.json.",
+						);
+					}
 				}
 
 				const provider = visionConfig.provider;
@@ -105,7 +219,7 @@ export default function (pi: ExtensionAPI) {
 				if (imageBuffer.length > MAX_IMAGE_SIZE) {
 					throw new Error(
 						`Image file "${params.path}" is too large (${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB). ` +
-						`Maximum size is ${MAX_IMAGE_SIZE / 1024 / 1024}MB. Please resize the image before analyzing.`,
+							`Maximum size is ${MAX_IMAGE_SIZE / 1024 / 1024}MB. Please resize the image before analyzing.`,
 					);
 				}
 
@@ -135,7 +249,7 @@ export default function (pi: ExtensionAPI) {
 				if (!apiKey) {
 					throw new Error(
 						`No API key found for provider "${provider}". ` +
-						`Please configure it via /login, set an environment variable, or add it to auth.json.`,
+							`Please configure it via /login, set an environment variable, or add it to auth.json.`,
 					);
 				}
 
