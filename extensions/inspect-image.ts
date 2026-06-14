@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, extname, join, resolve as resolvePath } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -22,12 +23,12 @@ interface InspectImageDetails {
 
 // ── Settings I/O ────────────────────────────────────────────────────
 
-function projectSettingsPath(cwd: string): string {
-	return join(cwd, ".pi", "settings.json");
+function globalSettingsPath(): string {
+	return join(homedir(), ".pi", "agent", "settings.json");
 }
 
-async function readProjectSettingsRaw(cwd: string): Promise<Record<string, unknown>> {
-	const path = projectSettingsPath(cwd);
+async function readGlobalSettingsRaw(): Promise<Record<string, unknown>> {
+	const path = globalSettingsPath();
 	if (!existsSync(path)) return {};
 	try {
 		const raw = await readFile(path, "utf-8");
@@ -37,22 +38,22 @@ async function readProjectSettingsRaw(cwd: string): Promise<Record<string, unkno
 	}
 }
 
-async function writeProjectSettings(cwd: string, settings: Record<string, unknown>): Promise<void> {
-	const path = projectSettingsPath(cwd);
+async function writeGlobalSettings(settings: Record<string, unknown>): Promise<void> {
+	const path = globalSettingsPath();
 	await mkdir(dirname(path), { recursive: true });
 	await writeFile(path, JSON.stringify(settings, null, 2) + "\n", "utf-8");
 }
 
-async function saveVisionConfig(cwd: string, config: VisionConfig): Promise<void> {
-	const settings = await readProjectSettingsRaw(cwd);
+async function saveVisionConfig(config: VisionConfig): Promise<void> {
+	const settings = await readGlobalSettingsRaw();
 	settings.visionConfig = config;
-	await writeProjectSettings(cwd, settings);
+	await writeGlobalSettings(settings);
 }
 
 // ── Vision Config Resolution ────────────────────────────────────────
 
-function getVisionConfig(cwd: string): VisionConfig | undefined {
-	const path = projectSettingsPath(cwd);
+function getVisionConfig(): VisionConfig | undefined {
+	const path = globalSettingsPath();
 	if (!existsSync(path)) return undefined;
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8"));
@@ -102,7 +103,7 @@ async function runVisionSetup(ctx: ExtensionContext): Promise<VisionConfig | und
 	let provider: string | undefined;
 	if (providerOptions.length > 0) {
 		const choice = await ctx.ui.select(
-			"Choose a vision provider  │  💡 project → .pi/settings.json  │  global → ~/.pi/agent/settings.json",
+			"Choose a vision provider  │  💡 saved to ~/.pi/agent/settings.json",
 			providerOptions,
 		);
 		if (!choice) return undefined;
@@ -139,7 +140,7 @@ async function runVisionSetup(ctx: ExtensionContext): Promise<VisionConfig | und
 	}
 
 	const config: VisionConfig = { provider, model: modelId };
-	await saveVisionConfig(ctx.cwd, config);
+	await saveVisionConfig(config);
 	return config;
 }
 
@@ -211,13 +212,13 @@ export default function (pi: ExtensionAPI) {
 				const { path, prompt } = params;
 
 				// Resolve vision configuration
-				let visionConfig = getVisionConfig(ctx.cwd);
+				let visionConfig = getVisionConfig();
 				if (!visionConfig) {
 					visionConfig = await runVisionSetup(ctx);
 					if (!visionConfig) {
 						throw new Error(
 							"Vision setup was cancelled or no vision models are available. " +
-								"Run /setup-vision to configure, or add a 'visionConfig' block to .pi/settings.json.",
+								"Run /setup-vision to configure, or add a 'visionConfig' block to ~/.pi/agent/settings.json.",
 						);
 					}
 				}
